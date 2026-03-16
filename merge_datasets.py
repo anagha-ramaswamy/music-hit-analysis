@@ -119,6 +119,9 @@ class DatasetMerger:
         scaler_audio = StandardScaler()
         scaler_lyrics = StandardScaler()
         
+        # Only use lyrics features that are actually present in the dataframe
+        feature_columns['lyrics_features'] = [f for f in feature_columns['lyrics_features'] if f in df.columns]
+
         # Scale features
         audio_features_scaled = scaler_audio.fit_transform(df[feature_columns['audio_features']])
         lyrics_features_scaled = scaler_lyrics.fit_transform(df[feature_columns['lyrics_features']])
@@ -135,6 +138,7 @@ class DatasetMerger:
             columns=[f"lyrics_{col}" for col in feature_columns['lyrics_features']],
             index=df.index
         )
+
         
         # Combine all features
         ml_features = pd.concat([audio_features_df, lyrics_features_df], axis=1)

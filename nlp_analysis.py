@@ -7,23 +7,16 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.cluster import KMeans
-from sklearn.decomposition import TruncatedSVD
+from sklearn.decomposition import TruncatedSVD, LatentDirichletAllocation
 from sklearn.manifold import TSNE
 import umap
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import nltk
+from gensim.models import Word2Vec
 from textblob import TextBlob
 from collections import Counter
 import re
 from tqdm import tqdm
-
-# Download required NLTK data
-try:
-    nltk.data.find('sentiment/vader_lexicon.zip')
-except LookupError:
-    nltk.download('vader_lexicon')
 
 # Set style
 plt.style.use('seaborn-v0_8')
@@ -36,8 +29,6 @@ class NLPAnalyzer:
         self.df = self.df.dropna(subset=['lyrics_clean'])
         self.prepare_data()
         
-        # Initialize sentiment analyzer
-        self.sia = SentimentIntensityAnalyzer()
     
     def prepare_data(self):
         """Prepare data for analysis"""
@@ -67,10 +58,16 @@ class NLPAnalyzer:
         ax1.plot(years, means, linewidth=3, color='royalblue', label='Mean Lexical Diversity')
         ax1.fill_between(years, means - stds, means + stds, alpha=0.3, color='royalblue')
         
-        # Add trend line
-        z = np.polyfit(years, means, 1)
+        # Add quadratic trend line (U-shape: simpler through 2000s, then streaming reversal)
+        z = np.polyfit(years, means, 2)
         p = np.poly1d(z)
-        ax1.plot(years, p(years), "r--", alpha=0.8, linewidth=2, label=f'Trend (slope: {z[0]:.4f})')
+        years_smooth = np.linspace(years.min(), years.max(), 300)
+        residuals = means - p(years)
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((means - means.mean()) ** 2)
+        r_squared = 1 - (ss_res / ss_tot)
+        ax1.plot(years_smooth, p(years_smooth), "r--", alpha=0.8, linewidth=2,
+                 label=f'Quadratic trend (R²={r_squared:.3f}, min ≈ {int(-z[1]/(2*z[0]))})')
         
         ax1.set_xlabel('Year', fontsize=12)
         ax1.set_ylabel('Lexical Diversity', fontsize=12)
@@ -91,8 +88,8 @@ class NLPAnalyzer:
         ax2.grid(True, alpha=0.3)
         
         # Add value labels on bars
-        for bar, mean in zip(bars, means_decade):
-            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + stds_decade[decades.tolist().index(bar.get_x())] + 0.001,
+        for bar, mean, std in zip(bars, means_decade, stds_decade):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.001,
                     f'{mean:.3f}', ha='center', va='bottom')
         
         plt.tight_layout()
@@ -107,26 +104,22 @@ class NLPAnalyzer:
         sentiments = []
         
         for lyrics in tqdm(self.df['lyrics_clean'], desc="Analyzing sentiment"):
-            # VADER sentiment
-            vader_scores = self.sia.polarity_scores(lyrics)
-            
-            # TextBlob sentiment
             blob = TextBlob(lyrics)
-            textblob_polarity = blob.sentiment.polarity
-            textblob_subjectivity = blob.sentiment.subjectivity
-            
+            polarity = blob.sentiment.polarity
+            subjectivity = blob.sentiment.subjectivity
             sentiments.append({
-                'vader_compound': vader_scores['compound'],
-                'vader_positive': vader_scores['pos'],
-                'vader_negative': vader_scores['neg'],
-                'vader_neutral': vader_scores['neu'],
-                'textblob_polarity': textblob_polarity,
-                'textblob_subjectivity': textblob_subjectivity
+                'vader_compound': polarity,  # use textblob polarity as proxy
+                'vader_positive': max(polarity, 0),
+                'vader_negative': abs(min(polarity, 0)),
+                'vader_neutral': 1 - abs(polarity),
+                'textblob_polarity': polarity,
+                'textblob_subjectivity': subjectivity
             })
         
         # Add to dataframe
         sentiment_df = pd.DataFrame(sentiments)
         self.df = pd.concat([self.df.reset_index(drop=True), sentiment_df], axis=1)
+        self.df = self.df.loc[:, ~self.df.columns.duplicated(keep='last')]
         
         # Analyze trends
         yearly_sentiment = self.df.groupby('year')[['vader_compound', 'textblob_polarity']].mean()
@@ -134,53 +127,56 @@ class NLPAnalyzer:
         # Plot sentiment trends
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
-        # VADER compound over time
-        axes[0, 0].plot(yearly_sentiment.index, yearly_sentiment['vader_compound'], 
+        # Sentiment over time
+        axes[0, 0].plot(yearly_sentiment.index, yearly_sentiment['vader_compound'],
                        linewidth=3, color='darkgreen')
         axes[0, 0].set_xlabel('Year')
-        axes[0, 0].set_ylabel('VADER Compound Score')
-        axes[0, 0].set_title('VADER Sentiment Over Time')
+        axes[0, 0].set_ylabel('Sentiment Score')
+        axes[0, 0].set_title('Sentiment Over Time')
         axes[0, 0].grid(True, alpha=0.3)
-        
-        # TextBlob polarity over time
-        axes[0, 1].plot(yearly_sentiment.index, yearly_sentiment['textblob_polarity'], 
+
+        # TextBlob subjectivity over time
+        axes[0, 1].plot(yearly_sentiment.index, yearly_sentiment['textblob_polarity'],
                        linewidth=3, color='darkorange')
         axes[0, 1].set_xlabel('Year')
         axes[0, 1].set_ylabel('TextBlob Polarity')
         axes[0, 1].set_title('TextBlob Sentiment Over Time')
         axes[0, 1].grid(True, alpha=0.3)
-        
+
         # Sentiment distribution by decade
         decade_sentiment = self.df.groupby('decade')['vader_compound'].mean()
-        bars = axes[1, 0].bar(decade_sentiment.index, decade_sentiment.values, 
+        bars = axes[1, 0].bar(decade_sentiment.index, decade_sentiment.values,
                              alpha=0.7, color='mediumpurple')
         axes[1, 0].set_xlabel('Decade')
-        axes[1, 0].set_ylabel('Mean VADER Compound')
+        axes[1, 0].set_ylabel('Mean Sentiment')
         axes[1, 0].set_title('Average Sentiment by Decade')
         axes[1, 0].grid(True, alpha=0.3)
-        
+
         # Add value labels
         for bar, val in zip(bars, decade_sentiment.values):
             axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                            f'{val:.3f}', ha='center', va='bottom')
-        
+
         # Sentiment vs Lexical Diversity scatter
-        axes[1, 1].scatter(self.df['lexical_diversity'], self.df['vader_compound'], 
+        axes[1, 1].scatter(self.df['lexical_diversity'], self.df['vader_compound'],
                           alpha=0.5, s=30)
         axes[1, 1].set_xlabel('Lexical Diversity')
-        axes[1, 1].set_ylabel('VADER Compound Score')
+        axes[1, 1].set_ylabel('Sentiment Score')
         axes[1, 1].set_title('Sentiment vs Lexical Diversity')
-        
+
         # Add correlation
         corr = self.df['lexical_diversity'].corr(self.df['vader_compound'])
-        axes[1, 1].text(0.05, 0.95, f'Correlation: {corr:.3f}', 
+        axes[1, 1].text(0.05, 0.95, f'Correlation: {corr:.3f}',
                        transform=axes[1, 1].transAxes, va='top')
         axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig('sentiment_analysis.png', dpi=300, bbox_inches='tight')
         plt.show()
-        
+
+        # Save enriched dataframe back so merge_datasets.py can access sentiment columns
+        self.df.to_csv('lyrics_clean.csv', index=False)
+
         return yearly_sentiment
     
     def analyze_vocabulary_drift(self):
@@ -195,6 +191,7 @@ class NLPAnalyzer:
         )
         
         # Fit and transform all lyrics
+        self.vectorizer = vectorizer
         tfidf_matrix = vectorizer.fit_transform(self.df['lyrics_clean'])
         feature_names = vectorizer.get_feature_names_out()
         
@@ -268,7 +265,7 @@ class NLPAnalyzer:
             mean_tfidf = np.mean(cluster_tfidf.toarray(), axis=0)
             
             # Get top 10 words
-            feature_names = vectorizer.get_feature_names_out()
+            feature_names = self.vectorizer.get_feature_names_out()
             top_word_indices = np.argsort(mean_tfidf)[-10:]
             top_words = [feature_names[i] for i in top_word_indices]
             
@@ -324,6 +321,122 @@ class NLPAnalyzer:
         
         return embedding
     
+    def analyze_lda_topics(self, n_topics=6):
+        """LDA topic modeling to show how lyrical themes shift by decade"""
+        # Use count vectorizer (LDA needs raw counts, not TF-IDF)
+        count_vec = CountVectorizer(max_features=3000, stop_words='english',
+                                    min_df=5, max_df=0.8)
+        count_matrix = count_vec.fit_transform(self.df['lyrics_clean'])
+        feature_names = count_vec.get_feature_names_out()
+
+        # Fit LDA
+        lda = LatentDirichletAllocation(n_components=n_topics, random_state=42,
+                                        max_iter=20, learning_method='online')
+        doc_topics = lda.fit_transform(count_matrix)
+
+        # Get top words per topic
+        topic_labels = []
+        for i, topic in enumerate(lda.components_):
+            top_words = [feature_names[j] for j in topic.argsort()[-8:][::-1]]
+            topic_labels.append(f"Topic {i+1}: {', '.join(top_words[:4])}")
+
+        # Add dominant topic to df
+        self.df['dominant_topic'] = doc_topics.argmax(axis=1)
+
+        # Plot: topic prevalence by decade
+        topic_by_decade = pd.DataFrame(doc_topics, columns=[f'Topic {i+1}' for i in range(n_topics)])
+        topic_by_decade['decade'] = self.df['decade'].values
+        decade_topics = topic_by_decade.groupby('decade').mean()
+
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+        # Stacked bar: topic mix per decade
+        decade_topics.plot(kind='bar', stacked=True, ax=axes[0],
+                           colormap='tab10', alpha=0.85)
+        axes[0].set_xlabel('Decade', fontsize=12)
+        axes[0].set_ylabel('Mean Topic Proportion', fontsize=12)
+        axes[0].set_title('Lyrical Theme Mix by Decade', fontsize=14, fontweight='bold')
+        axes[0].legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        axes[0].tick_params(axis='x', rotation=45)
+
+        # Heatmap of topic proportions
+        sns.heatmap(decade_topics.T, cmap='YlOrRd', annot=True, fmt='.2f',
+                    ax=axes[1], cbar_kws={'label': 'Mean Proportion'})
+        axes[1].set_title('Topic Heatmap by Decade', fontsize=14, fontweight='bold')
+        axes[1].set_xlabel('Decade')
+        axes[1].set_ylabel('Topic')
+
+        plt.tight_layout()
+        plt.savefig('lda_topic_analysis.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+        print("\nTop words per topic:")
+        for label in topic_labels:
+            print(f"  {label}")
+
+        return lda, doc_topics, topic_labels
+
+    def analyze_word2vec_drift(self, target_words=None):
+        """Word2Vec semantic drift: train per decade and track how word context shifts"""
+        if target_words is None:
+            target_words = ['love', 'baby', 'heart', 'girl', 'night', 'time', 'feel']
+
+        # Tokenize lyrics
+        self.df['tokens'] = self.df['lyrics_clean'].apply(
+            lambda x: [w for w in x.lower().split() if len(w) > 2])
+
+        decades = sorted(self.df['decade'].unique())
+        decade_models = {}
+
+        for decade in decades:
+            decade_lyrics = self.df[self.df['decade'] == decade]['tokens'].tolist()
+            if len(decade_lyrics) < 10:
+                continue
+            model = Word2Vec(sentences=decade_lyrics, vector_size=100, window=5,
+                             min_count=3, workers=4, epochs=20, seed=42)
+            decade_models[decade] = model
+
+        # For each target word, find most similar words per decade
+        fig, axes = plt.subplots(len(target_words), 1,
+                                 figsize=(14, 3 * len(target_words)))
+        if len(target_words) == 1:
+            axes = [axes]
+
+        for ax, word in zip(axes, target_words):
+            decades_present = []
+            top_neighbors = []
+            for decade, model in decade_models.items():
+                if word in model.wv:
+                    similar = model.wv.most_similar(word, topn=5)
+                    decades_present.append(decade)
+                    top_neighbors.append([w for w, _ in similar])
+
+            if not decades_present:
+                ax.axis('off')
+                ax.set_title(f'"{word}" not found', fontsize=10)
+                continue
+
+            # Display as table-style text
+            cell_text = [[', '.join(neighbors)] for neighbors in top_neighbors]
+            ax.axis('off')
+            table = ax.table(cellText=cell_text,
+                             rowLabels=decades_present,
+                             colLabels=[f'Top 5 words near "{word}"'],
+                             loc='center', cellLoc='left')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1, 1.4)
+            ax.set_title(f'Semantic neighbors of "{word}" by decade',
+                         fontsize=11, fontweight='bold', pad=2)
+
+        plt.suptitle('Word2Vec Semantic Drift: How Word Context Shifts Over Decades',
+                     fontsize=13, fontweight='bold', y=1.01)
+        plt.tight_layout()
+        plt.savefig('word2vec_semantic_drift.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+        return decade_models
+
     def run_full_analysis(self):
         """Run complete NLP analysis pipeline"""
         print("Starting NLP Lyrics Analysis...")
@@ -343,7 +456,13 @@ class NLPAnalyzer:
         
         print("\\n5. Creating UMAP visualization...")
         embedding = self.create_umap_visualization(tfidf_reduced)
-        
+
+        print("\\n6. Running LDA topic modeling...")
+        lda, doc_topics, topic_labels = self.analyze_lda_topics()
+
+        print("\\n7. Running Word2Vec semantic drift...")
+        decade_models = self.analyze_word2vec_drift()
+
         print("\\nAnalysis complete! Check the generated PNG files.")
         
         # Print cluster summary

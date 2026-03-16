@@ -35,14 +35,14 @@ class GeniusLyricsCollector:
             return ""
         
         # Remove section headers that might remain
-        lyrics = re.sub(r'\\[.*?\\]', '', lyrics)
-        
+        lyrics = re.sub(r'\[.*?\]', '', lyrics)
+
         # Remove line breaks and extra spaces
-        lyrics = re.sub(r'\\n+', ' ', lyrics)
-        lyrics = re.sub(r'\\s+', ' ', lyrics)
-        
+        lyrics = re.sub(r'\n+', ' ', lyrics)
+        lyrics = re.sub(r'\s+', ' ', lyrics)
+
         # Remove non-lyric content (parenthetical notes, ad-libs in parentheses)
-        lyrics = re.sub(r'\\([^)]*\\)', '', lyrics)
+        lyrics = re.sub(r'\([^)]*\)', '', lyrics)
         
         # Remove special characters but keep basic punctuation
         lyrics = re.sub(r'[^a-zA-Z0-9\s.,!?\'-]', '', lyrics)
@@ -57,16 +57,12 @@ class GeniusLyricsCollector:
         if not lyrics or len(lyrics) < 50:  # Too short to be real lyrics
             return False, "Lyrics too short"
         
-        # Check if artist name appears in lyrics (might indicate wrong song)
-        if expected_artist.lower() in lyrics.lower():
-            return False, "Artist name in lyrics (likely wrong song)"
-        
-        # Check for common non-lyric content
+        # Check for definitive non-lyric content (metadata phrases, not individual words)
         non_lyric_indicators = [
-            "lyrics", "song", "track", "album", "release", "copyright",
-            "produced by", "written by", "composer", "arranged"
+            "copyright", "produced by", "written by", "composer", "arranged by",
+            "all rights reserved", "unauthorized reproduction"
         ]
-        
+
         for indicator in non_lyric_indicators:
             if indicator in lyrics.lower():
                 return False, f"Contains non-lyric content: {indicator}"
@@ -78,7 +74,7 @@ class GeniusLyricsCollector:
         try:
             # Search for the song
             search_url = f"https://api.genius.com/search?q={title} {artist}"
-            headers = {'Authorization': f'Bearer {self.genius.access_token}'}
+            headers = {'Authorization': f'Bearer {self.genius._access_token}'}
             
             response = requests.get(search_url, headers=headers)
             response.raise_for_status()
@@ -184,6 +180,7 @@ class GeniusLyricsCollector:
         
         results = []
         failures = []
+        failures_df = pd.DataFrame()
         
         for idx, row in tqdm(remaining_songs.iterrows(), total=len(remaining_songs), desc="Collecting lyrics"):
             title = row['title']
@@ -206,8 +203,10 @@ class GeniusLyricsCollector:
                 }
                 results.append(result)
                 
-                # Save individual lyrics file
-                filename = f"{self.lyrics_dir}/{title}_{artist}.txt"
+                # Save individual lyrics file (sanitize slashes in names)
+                safe_title = re.sub(r'[/\\]', '-', title)
+                safe_artist = re.sub(r'[/\\]', '-', artist)
+                filename = f"{self.lyrics_dir}/{safe_title}_{safe_artist}.txt"
                 with open(filename, 'w', encoding='utf-8') as f:
                     f.write(lyrics)
             else:
@@ -220,18 +219,32 @@ class GeniusLyricsCollector:
             
             # Rate limiting - Genius API is strict
             time.sleep(0.5)
-        
-        # Save results
+
+            # Checkpoint every 10 songs
+            if (len(results) + len(failures)) % 10 == 0:
+                if results:
+                    new_results_df = pd.DataFrame(results)
+                    cache_df = pd.concat([cache_df, new_results_df], ignore_index=True)
+                    cache_df.to_csv(self.cache_file, index=False)
+                    results = []
+                if failures:
+                    existing = pd.read_csv(self.failures_file) if os.path.exists(self.failures_file) else pd.DataFrame()
+                    pd.concat([existing, pd.DataFrame(failures)], ignore_index=True).to_csv(self.failures_file, index=False)
+                    failures = []
+                print(f"Checkpoint: {len(cache_df)} lyrics saved")
+
+        # Save any remaining
         if results:
             new_results_df = pd.DataFrame(results)
             cache_df = pd.concat([cache_df, new_results_df], ignore_index=True)
             cache_df.to_csv(self.cache_file, index=False)
             print(f"Saved {len(results)} new lyrics")
-        
+
         if failures:
-            failures_df = pd.DataFrame(failures)
-            failures_df.to_csv(self.failures_file, index=False)
-            print(f"Logged {len(failures)} failures")
+            existing = pd.read_csv(self.failures_file) if os.path.exists(self.failures_file) else pd.DataFrame()
+            all_failures = pd.concat([existing, pd.DataFrame(failures)], ignore_index=True)
+            all_failures.to_csv(self.failures_file, index=False)
+            print(f"Logged {len(all_failures)} total failures")
         
         return cache_df, failures_df
 

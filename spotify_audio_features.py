@@ -1,247 +1,267 @@
 """
-Spotify Audio Feature Collection
-Collects audio features for songs using Spotify Web API
+Audio Feature Collection (YouTube + librosa)
+
+Searches YouTube for each song, downloads 30 seconds of audio using yt-dlp,
+then extracts audio features locally using librosa.
+
+Feature mapping:
+  tempo           : beat tracking BPM
+  energy          : normalized RMS energy
+  loudness        : mean loudness in dB
+  danceability    : normalized onset strength (rhythmic regularity proxy)
+  acousticness    : inverse normalized spectral centroid (lower brightness = more acoustic)
+  speechiness     : zero crossing rate (higher = more speech-like)
+  instrumentalness: inverse ZCR (higher = less vocal)
+  valence         : major/minor key detection via Krumhansl-Schmuckler profiles
+                    combined with tempo and energy (major key = higher valence)
 """
 
-import pandas as pd
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-import time
-from tqdm import tqdm
-import rapidfuzz
-from rapidfuzz import fuzz
-import json
 import os
+import re
+import time
+import tempfile
+import subprocess
+import numpy as np
+import pandas as pd
+import librosa
+from tqdm import tqdm
 
-class SpotifyAudioCollector:
-    def __init__(self, client_id, client_secret):
-        """Initialize Spotify client"""
-        self.sp = spotipy.Spotify(
-            client_credentials_manager=SpotifyClientCredentials(
-                client_id=client_id,
-                client_secret=client_secret
-            )
-        )
+
+class AudioCollector:
+    def __init__(self):
         self.cache_file = "audio_raw.csv"
         self.failures_file = "audio_failures.csv"
-        
-    def search_track(self, title, artist, max_retries=3):
-        """Search for track on Spotify with fuzzy matching fallback"""
-        
-        # Try exact search first
-        for attempt in range(max_retries):
-            try:
-                query = f"track:{title} artist:{artist}"
-                results = self.sp.search(q=query, type='track', limit=10)
-                
-                if results['tracks']['items']:
-                    # Find best match among results
-                    best_match = None
-                    best_score = 0
-                    
-                    for track in results['tracks']['items']:
-                        # Get track info
-                        track_title = track['name'].lower()
-                        track_artists = [a['name'].lower() for a in track['artists']]
-                        
-                        # Calculate similarity scores
-                        title_score = fuzz.ratio(title, track_title) / 100
-                        artist_score = max(fuzz.ratio(artist, a) / 100 for a in track_artists)
-                        
-                        # Combined score (weighted more toward title)
-                        combined_score = (title_score * 0.7 + artist_score * 0.3)
-                        
-                        if combined_score > best_score and combined_score > 0.85:
-                            best_score = combined_score
-                            best_match = track
-                    
-                    if best_match:
-                        return best_match
-                        
-                # If no good match, try broader search
-                if attempt == 0:
-                    query = f"{title} {artist}"
-                elif attempt == 1:
-                    query = title
-                else:
-                    break
-                    
-                results = self.sp.search(q=query, type='track', limit=5)
-                if results['tracks']['items']:
-                    return results['tracks']['items'][0]
-                    
-            except Exception as e:
-                print(f"Search error for {title} by {artist}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                break
-        
-        return None
-    
-    def get_audio_features(self, track_id):
-        """Get audio features for a track"""
+        self._check_ytdlp()
+
+    def _check_ytdlp(self):
+        """Verify yt-dlp is installed"""
+        import sys
+        result = subprocess.run([sys.executable, '-m', 'yt_dlp', '--version'],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("yt-dlp not found. Install with: pip3 install yt-dlp")
+        print(f"yt-dlp version: {result.stdout.strip()}")
+
+    @staticmethod
+    def clean_name(s):
+        """Strip featured artists, parentheticals for cleaner search queries"""
+        s = re.sub(r'\(feat\..*?\)', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\(ft\..*?\)', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'feat\..*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'ft\..*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'featuring.*', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'\(.*?\)', '', s)
+        return s.strip()
+
+    def download_audio(self, title, artist, duration=30):
+        """Search YouTube and download first 30 seconds of audio"""
+        query = f"{self.clean_name(title)} {self.clean_name(artist)} official audio"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, 'audio.%(ext)s')
+
+            import sys
+            cmd = [
+                sys.executable, '-m', 'yt_dlp',
+                f'ytsearch1:{query}',       # take first YouTube result
+                '--extract-audio',
+                '--audio-format', 'wav',
+                '--audio-quality', '5',     # medium quality, faster download
+                '--download-sections', f'*0-{duration}',  # first 30 seconds only
+                '--output', out_path,
+                '--quiet',
+                '--no-warnings',
+                '--no-playlist',
+            ]
+
+            env = os.environ.copy()
+            env['PATH'] = '/opt/homebrew/bin:/usr/local/bin:' + env.get('PATH', '')
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+
+            if result.returncode != 0:
+                print(f"yt-dlp error for '{title}': {result.stderr[:200]}")
+                return None
+
+            # Find the downloaded file
+            wav_files = [f for f in os.listdir(tmpdir) if f.endswith('.wav')]
+            if not wav_files:
+                return None
+
+            wav_path = os.path.join(tmpdir, wav_files[0])
+            return self.extract_librosa_features(wav_path)
+
+    def extract_librosa_features(self, wav_path):
+        """Extract audio features from a wav file using librosa"""
         try:
-            features = self.sp.audio_features([track_id])
-            if features and features[0]:
-                return features[0]
+            y, sr = librosa.load(wav_path, sr=22050, mono=True, duration=30.0)
+
+            # Tempo (BPM)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            tempo = float(np.atleast_1d(tempo)[0])
+
+            # Energy: use perceptual loudness (LUFS-like), mapped from typical range
+            rms = librosa.feature.rms(y=y)[0]
+            loudness_db = float(librosa.amplitude_to_db(rms).mean())
+            # Typical music ranges from -40dB (quiet) to -5dB (loud)
+            energy = float(np.clip((loudness_db + 40) / 35, 0, 1))
+
+            # Loudness (dB) - raw value for analysis
+            loudness = loudness_db
+
+            # Danceability: combine rhythmic regularity + tempo stability
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            # onset_strength mean typically ranges 1-8 for music
+            danceability = float(np.clip(np.mean(onset_env) / 6.0, 0, 1))
+
+            # Spectral centroid (brightness, normalized)
+            centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+            centroid_norm = float(np.mean(centroid)) / (sr / 2)
+
+            # Acousticness: inverse brightness (centroid_norm typically 0.05-0.25)
+            acousticness = float(np.clip(1.0 - centroid_norm * 8, 0, 1))
+
+            # Speechiness: use spectral flatness (tonal=instrumental, flat=speech/noise)
+            # Low flatness = tonal (instrumental), high flatness = noisy/speech
+            flatness = librosa.feature.spectral_flatness(y=y)[0]
+            # flatness typically 0-0.1 for music, higher for speech
+            speechiness = float(np.clip(np.mean(flatness) / 0.05, 0, 1))
+            instrumentalness = float(np.clip(1.0 - speechiness * 1.5, 0, 1))
+
+            # Valence: Krumhansl-Schmuckler key profiles
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            chroma_mean = np.mean(chroma, axis=1)
+            major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                                      2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+            minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                                      2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+            major_scores = [np.corrcoef(np.roll(major_profile, i), chroma_mean)[0, 1]
+                            for i in range(12)]
+            minor_scores = [np.corrcoef(np.roll(minor_profile, i), chroma_mean)[0, 1]
+                            for i in range(12)]
+            is_major = float(max(major_scores) >= max(minor_scores))
+            tempo_norm = float(np.clip((tempo - 60) / 140, 0, 1))
+            valence = float(0.5 * is_major + 0.3 * tempo_norm + 0.2 * energy)
+
+            return {
+                'tempo': tempo,
+                'energy': energy,
+                'loudness': loudness,
+                'danceability': danceability,
+                'acousticness': acousticness,
+                'speechiness': speechiness,
+                'instrumentalness': instrumentalness,
+                'valence': valence,
+            }
+
         except Exception as e:
-            print(f"Error getting audio features for {track_id}: {e}")
-        return None
-    
-    def process_songs(self, songs_df, batch_size=50):
+            print(f"librosa extraction error: {e}")
+            return None
+
+    def process_songs(self, songs_df):
         """Process all songs and collect audio features"""
-        
-        # Load existing cache if exists
         if os.path.exists(self.cache_file):
             cache_df = pd.read_csv(self.cache_file)
-            processed_titles = set(zip(cache_df['title'], cache_df['artist']))
+            processed = set(zip(cache_df['title'], cache_df['artist']))
             print(f"Loaded {len(cache_df)} cached results")
         else:
             cache_df = pd.DataFrame()
-            processed_titles = set()
-        
-        # Filter songs not yet processed
-        remaining_songs = songs_df[
-            ~songs_df.set_index(['title', 'artist']).index.isin(processed_titles)
+            processed = set()
+
+        remaining = songs_df[
+            ~songs_df.set_index(['title', 'artist']).index.isin(processed)
         ].copy()
-        
-        print(f"Processing {len(remaining_songs)} remaining songs...")
-        
+        print(f"Processing {len(remaining)} remaining songs...")
+
         results = []
         failures = []
-        
-        for idx, row in tqdm(remaining_songs.iterrows(), total=len(remaining_songs), desc="Collecting audio features"):
-            title = row['title']
-            artist = row['artist']
-            
-            # Search for track
-            track = self.search_track(title, artist)
-            
-            if track:
-                # Get audio features
-                features = self.get_audio_features(track['id'])
-                
-                if features:
-                    result = {
-                        'title': title,
-                        'artist': artist,
-                        'year': row['year'],
-                        'chart_position': row['chart_position'],
-                        'weeks_on_chart': row['weeks_on_chart'],
-                        'spotify_id': track['id'],
-                        'spotify_title': track['name'],
-                        'spotify_artists': ', '.join([a['name'] for a in track['artists']]),
-                        'danceability': features['danceability'],
-                        'energy': features['energy'],
-                        'valence': features['valence'],
-                        'tempo': features['tempo'],
-                        'acousticness': features['acousticness'],
-                        'instrumentalness': features['instrumentalness'],
-                        'speechiness': features['speechiness'],
-                        'loudness': features['loudness'],
-                        'duration_ms': features['duration_ms'],
-                        'match_score': 'found'
-                    }
-                    results.append(result)
-                else:
-                    failures.append({
-                        'title': title,
-                        'artist': artist,
-                        'year': row['year'],
-                        'error': 'audio_features_failed'
-                    })
+        songs_processed = 0
+
+        for idx, row in tqdm(remaining.iterrows(), total=len(remaining),
+                             desc="Collecting audio features"):
+            title, artist = row['title'], row['artist']
+
+            features = self.download_audio(title, artist)
+
+            if features:
+                results.append({
+                    'title': title,
+                    'artist': artist,
+                    'year': row['year'],
+                    'chart_position': row['chart_position'],
+                    'weeks_on_chart': row['weeks_on_chart'],
+                    **features,
+                })
             else:
                 failures.append({
                     'title': title,
                     'artist': artist,
                     'year': row['year'],
-                    'error': 'track_not_found'
+                    'error': 'download_failed',
                 })
-            
-            # Rate limiting
-            if idx % 10 == 0:
-                time.sleep(1)
-        
-        # Save results
+
+            songs_processed += 1
+
+            # Checkpoint every 10 songs
+            if songs_processed % 10 == 0:
+                if results:
+                    new_df = pd.DataFrame(results)
+                    cache_df = pd.concat([cache_df, new_df], ignore_index=True)
+                    cache_df.to_csv(self.cache_file, index=False)
+                    results = []
+                if failures:
+                    existing = pd.read_csv(self.failures_file) if os.path.exists(self.failures_file) else pd.DataFrame()
+                    pd.concat([existing, pd.DataFrame(failures)], ignore_index=True).to_csv(self.failures_file, index=False)
+                    failures = []
+                print(f"Checkpoint: {len(cache_df)} saved, {songs_processed} processed")
+
+        # Save any remaining
         if results:
-            new_results_df = pd.DataFrame(results)
-            cache_df = pd.concat([cache_df, new_results_df], ignore_index=True)
+            new_df = pd.DataFrame(results)
+            cache_df = pd.concat([cache_df, new_df], ignore_index=True)
             cache_df.to_csv(self.cache_file, index=False)
-            print(f"Saved {len(results)} new audio features")
-        
         if failures:
-            failures_df = pd.DataFrame(failures)
-            failures_df.to_csv(self.failures_file, index=False)
-            print(f"Logged {len(failures)} failures")
-        
-        return cache_df, failures_df
-    
+            existing = pd.read_csv(self.failures_file) if os.path.exists(self.failures_file) else pd.DataFrame()
+            all_failures = pd.concat([existing, pd.DataFrame(failures)], ignore_index=True)
+            all_failures.to_csv(self.failures_file, index=False)
+            print(f"Logged {len(all_failures)} total failures")
+
+        return cache_df, pd.DataFrame(failures)
+
     def clean_audio_data(self, df):
         """Clean and validate audio feature data"""
-        
-        # Add decade column
         df['decade'] = (df['year'] // 10) * 10
         df['decade'] = df['decade'].astype(str) + 's'
-        
-        # Check for outliers and bad data
+
         print(f"Before cleaning: {len(df)} songs")
-        
-        # Remove songs with invalid tempo or duration
-        df = df[(df['tempo'] > 0) & (df['tempo'] < 300)]  # Reasonable tempo range
-        df = df[(df['duration_ms'] > 30000) & (df['duration_ms'] < 600000)]  # 30s to 10min
-        
-        # Check for null values in key features
-        key_features = ['danceability', 'energy', 'valence', 'tempo', 'acousticness', 
-                       'instrumentalness', 'speechiness', 'loudness']
-        
-        null_counts = df[key_features].isnull().sum()
-        if null_counts.any():
-            print(f"Null values found: {null_counts[null_counts > 0].to_dict()}")
-            df = df.dropna(subset=key_features)
-        
+        df = df[(df['tempo'] > 40) & (df['tempo'] < 220)]
+
+        key_features = ['danceability', 'energy', 'valence', 'tempo',
+                        'acousticness', 'instrumentalness', 'speechiness', 'loudness']
+        df = df.dropna(subset=key_features)
+
         print(f"After cleaning: {len(df)} songs")
-        
-        # Save clean version
         df.to_csv('audio_clean.csv', index=False)
         print("Saved audio_clean.csv")
-        
         return df
 
+
 def main():
-    """Main execution function"""
-    
-    # Load songs data
     if not os.path.exists('songs.csv'):
         print("Error: songs.csv not found. Run Phase_0_Billboard_Data.ipynb first!")
         return
-    
+
     songs_df = pd.read_csv('songs.csv')
     print(f"Loaded {len(songs_df)} songs from songs.csv")
-    
-    # Get Spotify credentials (you'll need to set these)
-    # Register at: https://developer.spotify.com/dashboard
-    CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID', 'your_client_id_here')
-    CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET', 'your_client_secret_here')
-    
-    if CLIENT_ID == 'your_client_id_here' or CLIENT_SECRET == 'your_client_secret_here':
-        print("Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables")
-        print("Or modify the CLIENT_ID and CLIENT_SECRET variables in this script")
-        return
-    
-    # Initialize collector
-    collector = SpotifyAudioCollector(CLIENT_ID, CLIENT_SECRET)
-    
-    # Process songs
+
+    collector = AudioCollector()
     audio_df, failures_df = collector.process_songs(songs_df)
-    
-    # Clean data
     clean_df = collector.clean_audio_data(audio_df)
-    
+
     print(f"\nFinal results:")
     print(f"Successfully processed: {len(clean_df)} songs")
     print(f"Failed: {len(failures_df)} songs")
     print(f"Success rate: {len(clean_df) / len(songs_df) * 100:.1f}%")
+
 
 if __name__ == "__main__":
     main()

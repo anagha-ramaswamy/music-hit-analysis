@@ -3,6 +3,7 @@ Audio Feature Analysis
 Analyzes Spotify audio features for trends and patterns over decades
 """
 
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -50,36 +51,24 @@ class AudioAnalyzer:
         print(f"Decades covered: {', '.join(sorted(self.df['decade'].unique()))}")
     
     def plot_feature_distributions(self):
-        """Create ridgeline plots showing feature distributions by decade"""
+        """Create KDE plots showing feature distributions by decade"""
+        key_features = ['energy', 'danceability', 'valence', 'acousticness']
+        decades = sorted(self.df['decade'].unique())
+        colors = sns.color_palette('husl', len(decades))
+
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         axes = axes.flatten()
-        
-        # Key features for ridgeline plots
-        key_features = ['energy', 'danceability', 'valence', 'acousticness']
-        
+
         for i, feature in enumerate(key_features):
-            # Prepare data for joypy
-            decades = sorted(self.df['decade'].unique())
-            data_by_decade = []
-            
-            for decade in decades:
-                values = self.df[self.df['decade'] == decade][feature].values
-                data_by_decade.append(values)
-            
-            # Create ridgeline plot
-            joypy.joyplot(
-                data_by_decade,
-                labels=decades,
-                ax=axes[i],
-                overlap=2,
-                fill=True,
-                alpha=0.7,
-                linewidth=1
-            )
-            
-            axes[i].set_title(f'{feature.title()} Distribution by Decade', fontsize=14, fontweight='bold')
+            for j, decade in enumerate(decades):
+                data = self.df[self.df['decade'] == decade][feature].dropna()
+                sns.kdeplot(data, ax=axes[i], label=decade, color=colors[j],
+                            fill=True, alpha=0.3, linewidth=1.5)
+            axes[i].set_title(f'{feature.title()} Distribution by Decade',
+                              fontsize=14, fontweight='bold')
             axes[i].set_xlabel(feature.title(), fontsize=12)
-        
+            axes[i].legend(fontsize=8, ncol=2)
+
         plt.tight_layout()
         plt.savefig('audio_ridgeline_plots.png', dpi=300, bbox_inches='tight')
         plt.show()
@@ -212,8 +201,8 @@ class AudioAnalyzer:
     def analyze_feature_importance(self):
         """Analyze which features correlate with chart success"""
         # Create binary success metrics
-        self.df['top10'] = (self.df['chart_position'] <= 10).astype(1)
-        self.df['top20'] = (self.df['chart_position'] <= 20).astype(1)
+        self.df['top10'] = (self.df['chart_position'] <= 10).astype(int)
+        self.df['top20'] = (self.df['chart_position'] <= 20).astype(int)
         
         # Calculate feature correlations with success
         success_correlations = {}
@@ -245,18 +234,17 @@ class AudioAnalyzer:
             ax1.text(corr + 0.01 if corr >= 0 else corr - 0.01, i, 
                     f'{corr:.3f}', ha='left' if corr >= 0 else 'right', va='center')
         
-        # Weeks on chart correlations
-        weeks_corrs = [success_correlations[f]['weeks_correlation'] for f in features]
-        colors = ['red' if x < 0 else 'green' for x in weeks_corrs]
-        bars2 = ax2.barh(features, weeks_corrs, color=colors, alpha=0.7)
-        ax2.set_xlabel('Correlation with Weeks on Chart', fontsize=12)
-        ax2.set_title('Audio Features vs Chart Longevity', fontsize=14, fontweight='bold')
-        ax2.axvline(x=0, color='black', linestyle='-', alpha=0.3)
-        
-        # Add value labels
-        for i, (bar, corr) in enumerate(zip(bars2, weeks_corrs)):
-            ax2.text(corr + 0.01 if corr >= 0 else corr - 0.01, i, 
-                    f'{corr:.3f}', ha='left' if corr >= 0 else 'right', va='center')
+        # Feature variance by decade (higher variance = more diverse sounds)
+        decades = sorted(self.df['decade'].unique())
+        decade_vars = self.df.groupby('decade')[self.audio_features].std().mean(axis=1)
+        bars2 = ax2.bar(decades, decade_vars.values, alpha=0.7, color='steelblue')
+        ax2.set_xlabel('Decade', fontsize=12)
+        ax2.set_ylabel('Mean Feature Std Dev', fontsize=12)
+        ax2.set_title('Audio Diversity by Decade\n(Lower = More Homogeneous)', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        for bar, val in zip(bars2, decade_vars.values):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                    f'{val:.3f}', ha='center', va='bottom')
         
         plt.tight_layout()
         plt.savefig('audio_feature_importance.png', dpi=300, bbox_inches='tight')
